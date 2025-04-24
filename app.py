@@ -11,6 +11,7 @@ import gradio as gr
 import numpy as np
 import soundfile as sf
 import torch
+import random
 
 from dia.model import Dia
 
@@ -192,6 +193,10 @@ def run_inference_on_chunk(
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
             print(f"Using seed: {seed}")
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
         # Run Generation
         with torch.inference_mode():
@@ -202,7 +207,7 @@ def run_inference_on_chunk(
                 temperature=temperature,
                 top_p=top_p,
                 cfg_filter_top_k=cfg_filter_top_k,  # Pass the value here
-                use_torch_compile=False,  # Keep False for Gradio stability
+                use_torch_compile=True,  # Keep False for Gradio stability
                 audio_prompt=prompt_path_for_generate,
             )
 

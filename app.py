@@ -1,8 +1,11 @@
 import argparse
 import tempfile
 import time
+import re
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
+import concurrent.futures
+import os
 
 import gradio as gr
 import numpy as np
@@ -44,8 +47,78 @@ except Exception as e:
     raise
 
 
-def run_inference(
-    text_input: str,
+def split_text_into_chunks(text: str, max_chunk_length: int = 300) -> List[str]:
+    """
+    Split text into manageable chunks at meaningful boundaries (sentence/dialogue breaks).
+    
+    Args:
+        text: Input text to be split
+        max_chunk_length: Maximum length of each chunk (in characters)
+        
+    Returns:
+        List of text chunks
+    """
+    # Define meaningful boundaries where we can split (in order of priority)
+    boundaries = [
+        r'\n\n',          # Double line breaks - paragraph boundaries
+        r'\[S[12]\]',     # Speaker changes
+        r'\.\s',          # End of sentences
+        r'[?!]\s',        # Question or exclamation marks
+        r',\s',           # Commas
+        r'\s'             # Any whitespace as last resort
+    ]
+    
+    chunks = []
+    current_text = text.strip()
+    
+    while current_text:
+        # If the current text is already below the maximum length, add it as the final chunk
+        if len(current_text) <= max_chunk_length:
+            chunks.append(current_text)
+            break
+        
+        # Try to find a good split point within the max_chunk_length
+        split_index = None
+        
+        # Try each boundary pattern in order of priority
+        for pattern in boundaries:
+            # Look for the pattern near the maximum chunk length
+            # Search backwards from max_chunk_length
+            matches = list(re.finditer(pattern, current_text[:max_chunk_length]))
+            if matches:
+                # Get the last match (closest to max_chunk_length without exceeding it)
+                match = matches[-1]
+                # For speaker changes, we want to include the speaker tag in the next chunk
+                if pattern == r'\[S[12]\]':
+                    split_index = match.start()
+                else:
+                    split_index = match.end()
+                break
+        
+        # If no good boundary found, just split at max_chunk_length
+        if split_index is None or split_index == 0:
+            split_index = max_chunk_length
+        
+        # Add the chunk and continue with the rest of the text
+        chunks.append(current_text[:split_index].strip())
+        current_text = current_text[split_index:].strip()
+        
+        # Ensure the next chunk starts with a speaker tag if possible
+        if chunks and not re.match(r'^\[S[12]\]', current_text) and re.search(r'\[S[12]\]', current_text):
+            # Find the first speaker tag in the remaining text
+            match = re.search(r'\[S[12]\]', current_text)
+            if match:
+                # Add text before the speaker tag to the previous chunk if it's not too long
+                previous_chunk = chunks[-1]
+                if len(previous_chunk) + match.start() <= max_chunk_length * 1.5:
+                    chunks[-1] = previous_chunk + " " + current_text[:match.start()].strip()
+                    current_text = current_text[match.start():].strip()
+    
+    return chunks
+
+
+def run_inference_on_chunk(
+    chunk_text: str,
     audio_prompt_input: Optional[Tuple[int, np.ndarray]],
     max_new_tokens: int,
     cfg_scale: float,
@@ -53,17 +126,14 @@ def run_inference(
     top_p: float,
     cfg_filter_top_k: int,
     speed_factor: float,
-):
-    """
-    Runs Nari inference using the globally loaded model and provided inputs.
-    Uses temporary files for text and audio prompt compatibility with inference.generate.
-    """
-    global model, device  # Access global model, config, device
+    seed: Optional[int] = None,
+) -> tuple:
+    """Run inference on a single text chunk"""
+    global model, device
 
-    if not text_input or text_input.isspace():
-        raise gr.Error("Text input cannot be empty.")
+    if not chunk_text or chunk_text.isspace():
+        return None
 
-    temp_txt_file_path = None
     temp_audio_prompt_path = None
     output_audio = (44100, np.zeros(1, dtype=np.float32))
 
@@ -73,7 +143,7 @@ def run_inference(
             sr, audio_data = audio_prompt_input
             # Check if audio_data is valid
             if audio_data is None or audio_data.size == 0 or audio_data.max() == 0:  # Check for silence/empty
-                gr.Warning("Audio prompt seems empty or silent, ignoring prompt.")
+                print("Audio prompt seems empty or silent, ignoring prompt.")
             else:
                 # Save prompt audio to a temporary WAV file
                 with tempfile.NamedTemporaryFile(mode="wb", suffix=".wav", delete=False) as f_audio:
@@ -85,12 +155,12 @@ def run_inference(
                         max_val = np.iinfo(audio_data.dtype).max
                         audio_data = audio_data.astype(np.float32) / max_val
                     elif not np.issubdtype(audio_data.dtype, np.floating):
-                        gr.Warning(f"Unsupported audio prompt dtype {audio_data.dtype}, attempting conversion.")
+                        print(f"Unsupported audio prompt dtype {audio_data.dtype}, attempting conversion.")
                         # Attempt conversion, might fail for complex types
                         try:
                             audio_data = audio_data.astype(np.float32)
                         except Exception as conv_e:
-                            raise gr.Error(f"Failed to convert audio prompt to float32: {conv_e}")
+                            raise Exception(f"Failed to convert audio prompt to float32: {conv_e}")
 
                     # Ensure mono (average channels if stereo)
                     if audio_data.ndim > 1:
@@ -99,9 +169,7 @@ def run_inference(
                         elif audio_data.shape[1] == 2:  # Assume (N, 2)
                             audio_data = np.mean(audio_data, axis=1)
                         else:
-                            gr.Warning(
-                                f"Audio prompt has unexpected shape {audio_data.shape}, taking first channel/axis."
-                            )
+                            print(f"Audio prompt has unexpected shape {audio_data.shape}, taking first channel/axis.")
                             audio_data = (
                                 audio_data[0] if audio_data.shape[0] < audio_data.shape[1] else audio_data[:, 0]
                             )
@@ -116,16 +184,19 @@ def run_inference(
                         print(f"Created temporary audio prompt file: {temp_audio_prompt_path} (orig sr: {sr})")
                     except Exception as write_e:
                         print(f"Error writing temporary audio file: {write_e}")
-                        raise gr.Error(f"Failed to save audio prompt: {write_e}")
+                        raise Exception(f"Failed to save audio prompt: {write_e}")
 
-        # 3. Run Generation
+        # Set seed if provided
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            print(f"Using seed: {seed}")
 
-        start_time = time.time()
-
-        # Use torch.inference_mode() context manager for the generation call
+        # Run Generation
         with torch.inference_mode():
             output_audio_np = model.generate(
-                text_input,
+                chunk_text,
                 max_tokens=max_new_tokens,
                 cfg_scale=cfg_scale,
                 temperature=temperature,
@@ -135,10 +206,7 @@ def run_inference(
                 audio_prompt=prompt_path_for_generate,
             )
 
-        end_time = time.time()
-        print(f"Generation finished in {end_time - start_time:.2f} seconds.")
-
-        # 4. Convert Codes to Audio
+        # Process Audio
         if output_audio_np is not None:
             # Get sample rate from the loaded DAC model
             output_sr = 44100
@@ -165,36 +233,17 @@ def run_inference(
                 print(f"Skipping audio speed adjustment (factor: {speed_factor:.2f}).")
             # --- End slowdown ---
 
-            print(f"Audio conversion successful. Final shape: {output_audio[1].shape}, Sample Rate: {output_sr}")
-
-            # Explicitly convert to int16 to prevent Gradio warning
-            if output_audio[1].dtype == np.float32 or output_audio[1].dtype == np.float64:
-                audio_for_gradio = np.clip(output_audio[1], -1.0, 1.0)
-                audio_for_gradio = (audio_for_gradio * 32767).astype(np.int16)
-                output_audio = (output_sr, audio_for_gradio)
-                print("Converted audio to int16 for Gradio output.")
-
         else:
-            print("\nGeneration finished, but no valid tokens were produced.")
-            # Return default silence
-            gr.Warning("Generation produced no output.")
+            print("\nGeneration for chunk finished, but no valid tokens were produced.")
+            output_audio = (44100, np.zeros(1, dtype=np.float32))
 
     except Exception as e:
-        print(f"Error during inference: {e}")
+        print(f"Error during inference for chunk: {e}")
         import traceback
-
         traceback.print_exc()
-        # Re-raise as Gradio error to display nicely in the UI
-        raise gr.Error(f"Inference failed: {e}")
-
+        return None
     finally:
-        # 5. Cleanup Temporary Files defensively
-        if temp_txt_file_path and Path(temp_txt_file_path).exists():
-            try:
-                Path(temp_txt_file_path).unlink()
-                print(f"Deleted temporary text file: {temp_txt_file_path}")
-            except OSError as e:
-                print(f"Warning: Error deleting temporary text file {temp_txt_file_path}: {e}")
+        # Cleanup
         if temp_audio_prompt_path and Path(temp_audio_prompt_path).exists():
             try:
                 Path(temp_audio_prompt_path).unlink()
@@ -203,6 +252,120 @@ def run_inference(
                 print(f"Warning: Error deleting temporary audio prompt file {temp_audio_prompt_path}: {e}")
 
     return output_audio
+
+
+def run_inference(
+    text_input: str,
+    audio_prompt_input: Optional[Tuple[int, np.ndarray]],
+    max_new_tokens: int,
+    cfg_scale: float,
+    temperature: float,
+    top_p: float,
+    cfg_filter_top_k: int,
+    speed_factor: float,
+    seed: Optional[int] = None,
+    enable_chunking: bool = False,
+    max_chunk_length: int = 300,
+    progress=gr.Progress(),
+):
+    """
+    Runs Nari inference using the globally loaded model and provided inputs.
+    Supports processing long texts by splitting into chunks and processing in sequence.
+    """
+    global model, device
+
+    if not text_input or text_input.isspace():
+        raise gr.Error("Text input cannot be empty.")
+    
+    start_time = time.time()
+    
+    # Process text as a single unit or split into chunks
+    if enable_chunking:
+        chunks = split_text_into_chunks(text_input, max_chunk_length)
+        total_chunks = len(chunks)
+        print(f"Split text into {total_chunks} chunks for processing")
+        
+        # Create progress tracker
+        progress_text = gr.Markdown(f"Processing 0/{total_chunks} chunks...")
+        progress(0, desc="Starting batch processing...")
+        
+        # Process chunks with same seed to maintain speaker consistency
+        chunk_results = []
+        chunk_audios = []
+        
+        for i, chunk in enumerate(chunks):
+            progress((i + 0.5) / total_chunks, desc=f"Processing chunk {i+1}/{total_chunks}...")
+            print(f"Processing chunk {i+1}/{total_chunks}: {chunk[:50]}...")
+            
+            # Process this chunk
+            result = run_inference_on_chunk(
+                chunk,
+                audio_prompt_input if i == 0 else None,  # Only use audio prompt for first chunk
+                max_new_tokens,
+                cfg_scale,
+                temperature,
+                top_p,
+                cfg_filter_top_k,
+                speed_factor,
+                seed if seed is not None else None  # Use the same seed for all chunks
+            )
+            
+            # Check if generation succeeded
+            if result is not None:
+                chunk_audios.append(result[1])
+                chunk_results.append(result)
+            else:
+                print(f"Warning: Chunk {i+1} failed to generate, skipping.")
+            
+            progress((i + 1) / total_chunks, desc=f"Processed {i+1}/{total_chunks} chunks")
+        
+        # Combine all audio chunks
+        if chunk_audios:
+            sample_rate = 44100  # Assuming all chunks have the same sample rate
+            combined_audio = np.concatenate(chunk_audios)
+            output_audio = (sample_rate, combined_audio)
+            
+            # Explicitly convert to int16 to prevent Gradio warning
+            if output_audio[1].dtype == np.float32 or output_audio[1].dtype == np.float64:
+                audio_for_gradio = np.clip(output_audio[1], -1.0, 1.0)
+                audio_for_gradio = (audio_for_gradio * 32767).astype(np.int16)
+                output_audio = (output_audio[0], audio_for_gradio)
+                print("Converted audio to int16 for Gradio output.")
+        else:
+            print("No valid audio was generated from any chunk.")
+            output_audio = (44100, np.zeros(1, dtype=np.float32))
+    else:
+        # Process as a single unit, original method
+        progress(0, desc="Starting processing...")
+        output_audio = run_inference_on_chunk(
+            text_input,
+            audio_prompt_input,
+            max_new_tokens,
+            cfg_scale,
+            temperature,
+            top_p,
+            cfg_filter_top_k,
+            speed_factor,
+            seed
+        )
+        progress(1, desc="Processing complete")
+        
+        # Ensure output is in the right format
+        if output_audio is None:
+            output_audio = (44100, np.zeros(1, dtype=np.float32))
+            print("Generation failed to produce valid output.")
+        else:
+            # Explicitly convert to int16 to prevent Gradio warning
+            if output_audio[1].dtype == np.float32 or output_audio[1].dtype == np.float64:
+                audio_for_gradio = np.clip(output_audio[1], -1.0, 1.0)
+                audio_for_gradio = (audio_for_gradio * 32767).astype(np.int16)
+                output_audio = (output_audio[0], audio_for_gradio)
+    
+    end_time = time.time()
+    total_time = end_time - start_time
+    print(f"Total generation time: {total_time:.2f} seconds")
+    
+    return output_audio, f"Generation completed in {total_time:.2f} seconds"
 
 
 # --- Create Gradio Interface ---
@@ -224,6 +387,7 @@ if example_txt_path.exists():
 # Build Gradio UI
 with gr.Blocks(css=css) as demo:
     gr.Markdown("# Nari Text-to-Speech Synthesis")
+    status_output = gr.Markdown("Ready to generate audio")
 
     with gr.Row(equal_height=False):
         with gr.Column(scale=1):
@@ -231,7 +395,7 @@ with gr.Blocks(css=css) as demo:
                 label="Input Text",
                 placeholder="Enter text here...",
                 value=default_text,
-                lines=5,  # Increased lines
+                lines=7,  # Increased lines for longer text
             )
             audio_prompt_input = gr.Audio(
                 label="Audio Prompt (Optional)",
@@ -239,6 +403,28 @@ with gr.Blocks(css=css) as demo:
                 sources=["upload", "microphone"],
                 type="numpy",
             )
+            
+            with gr.Accordion("Chunking and Batch Settings", open=True):
+                enable_chunking = gr.Checkbox(
+                    label="Enable Text Chunking for Long Inputs",
+                    value=True,
+                    info="Process text in meaningful chunks for better handling of long inputs."
+                )
+                max_chunk_length = gr.Slider(
+                    label="Maximum Chunk Length (characters)",
+                    minimum=100,
+                    maximum=800,
+                    value=300,
+                    step=50,
+                    info="Maximum character length for each text chunk when processing long inputs."
+                )
+                seed_value = gr.Number(
+                    label="Random Seed",
+                    value=None,
+                    precision=0,
+                    info="Set a seed value to maintain consistent voices across generations. Leave empty for random results."
+                )
+            
             with gr.Accordion("Generation Parameters", open=False):
                 max_new_tokens = gr.Slider(
                     label="Max New Tokens (Audio Length)",
@@ -297,6 +483,7 @@ with gr.Blocks(css=css) as demo:
                 type="numpy",
                 autoplay=False,
             )
+            generation_time = gr.Markdown("")
 
     # Link button click to function
     run_button.click(
@@ -310,8 +497,11 @@ with gr.Blocks(css=css) as demo:
             top_p,
             cfg_filter_top_k,
             speed_factor_slider,
+            seed_value,
+            enable_chunking,
+            max_chunk_length,
         ],
-        outputs=[audio_output],  # Add status_output here if using it
+        outputs=[audio_output, generation_time],
         api_name="generate_audio",
     )
 
@@ -327,6 +517,9 @@ with gr.Blocks(css=css) as demo:
             0.95,
             35,
             0.94,
+            42,  # Seed value
+            True,  # Enable chunking
+            300,   # Max chunk length
         ],
         [
             "[S1] Open weights text to dialogue model. \n[S2] You get full control over scripts and voices. \n[S1] I'm biased, but I think we clearly won. \n[S2] Hard to disagree. (laughs) \n[S1] Thanks for listening to this demo. \n[S2] Try it now on Git hub and Hugging Face. \n[S1] If you liked our model, please give us a star and share to your friends. \n[S2] This was Nari Labs.",
@@ -337,6 +530,9 @@ with gr.Blocks(css=css) as demo:
             0.95,
             35,
             0.94,
+            42,  # Seed value
+            True,  # Enable chunking
+            300,   # Max chunk length
         ],
     ]
 
@@ -352,8 +548,11 @@ with gr.Blocks(css=css) as demo:
                 top_p,
                 cfg_filter_top_k,
                 speed_factor_slider,
+                seed_value,
+                enable_chunking,
+                max_chunk_length,
             ],
-            outputs=[audio_output],
+            outputs=[audio_output, generation_time],
             fn=run_inference,
             cache_examples=False,
             label="Examples (Click to Run)",
